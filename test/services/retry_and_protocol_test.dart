@@ -716,4 +716,51 @@ void main() {
       });
     });
   });
+
+  group('retry exhaustion — the attempt budget', () {
+    test(
+      'maxRetries is the total attempt count, not retries after the first',
+      () {
+        FakeAsync().run((async) {
+          final retryService = MessageRetryService()..setMaxRetries(5);
+          final attempts = <int>[];
+          final updates = <Message>[];
+          final contact = _makeContact(
+            publicKey: recipientKey,
+            pathLength: 2,
+            path: const [0x10, 0x20],
+          );
+
+          retryService.initialize(
+            RetryServiceConfig(
+              sendMessage: (_, _, attempt, _) => attempts.add(attempt),
+              addMessage: (_, _) {},
+              updateMessage: updates.add,
+              clearContactPath: (_) {},
+              setContactPath: (_, _, _) {},
+            ),
+          );
+
+          retryService.sendMessageWithRetry(contact: contact, text: 'hello');
+          async.flushMicrotasks();
+          async.elapse(const Duration(minutes: 5));
+          async.flushMicrotasks();
+
+          expect(attempts, [
+            0,
+            1,
+            2,
+            3,
+            4,
+          ], reason: 'maxRetries transmissions in total, indexed from 0');
+          expect(updates.last.status, MessageStatus.failed);
+          expect(
+            updates.last.retryCount,
+            4,
+            reason: 'chat_screen divides retryCount by maxMessageRetries - 1',
+          );
+        });
+      },
+    );
+  });
 }

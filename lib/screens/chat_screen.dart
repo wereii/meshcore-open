@@ -1430,10 +1430,14 @@ class _MessageBubble extends StatelessWidget {
                               child: Text(
                                 context.l10n.chat_retryCount(
                                   message.retryCount,
+                                  // maxMessageRetries counts total attempts;
+                                  // retryCount is the 0-based attempt index, so
+                                  // the last retry is maxMessageRetries - 1.
                                   context
-                                      .read<AppSettingsService>()
-                                      .settings
-                                      .maxMessageRetries,
+                                          .read<AppSettingsService>()
+                                          .settings
+                                          .maxMessageRetries -
+                                      1,
                                 ),
                                 style: MeshTheme.mono(
                                   fontSize: 12 * textScale,
