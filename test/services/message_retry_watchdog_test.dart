@@ -19,7 +19,6 @@ void main() {
   late Map<String, Message> latest;
   late List<({int attempt, int timestamp})> sends;
   late int timeoutMs;
-  final selfKey = Uint8List(32);
 
   setUp(() {
     service = MessageRetryService(
@@ -35,7 +34,6 @@ void main() {
         },
         addMessage: (_, m) => latest[m.messageId] = m,
         updateMessage: (m) => latest[m.messageId] = m,
-        getSelfPublicKey: () => selfKey,
         calculateTimeout: (_, _, {String? contactKey, int? deviceTimeoutMs}) =>
             timeoutMs,
       ),
@@ -43,13 +41,6 @@ void main() {
   });
 
   tearDown(() => service.dispose());
-
-  int ackHashFor(int attempt) => MessageRetryService.computeExpectedAckHash(
-    sends.first.timestamp,
-    attempt,
-    'hello',
-    selfKey,
-  );
 
   test('missing RESP_CODE_SENT times out and retries', () async {
     await service.sendMessageWithRetry(contact: _contact(), text: 'hello');
@@ -67,29 +58,11 @@ void main() {
     await pumpEventQueue();
 
     timeoutMs = 60000;
-    expect(service.updateMessageFromSent(ackHashFor(0), 0), isTrue);
+    expect(service.updateMessageFromSent(0x1234, 0), isTrue);
 
     await Future<void>.delayed(const Duration(milliseconds: 200));
 
     expect(sends, hasLength(1));
     expect(latest.values.single.status, MessageStatus.sent);
-  });
-
-  test('late ACK for an attempt whose SENT was lost still delivers', () async {
-    await service.sendMessageWithRetry(contact: _contact(), text: 'hello');
-    await pumpEventQueue();
-
-    // Let the watchdog fire; the retry is now waiting on its backoff.
-    await Future<void>.delayed(const Duration(milliseconds: 100));
-    expect(latest.values.single.retryCount, 1);
-
-    service.handleAckReceived(ackHashFor(0), 500);
-
-    expect(latest.values.single.status, MessageStatus.delivered);
-    expect(service.hasPendingMessages, isFalse);
-
-    // The cancelled backoff must not resend.
-    await Future<void>.delayed(const Duration(milliseconds: 1100));
-    expect(sends, hasLength(1));
   });
 }

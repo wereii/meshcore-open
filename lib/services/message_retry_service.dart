@@ -49,7 +49,6 @@ class RetryServiceConfig {
     int? deviceTimeoutMs,
   })?
   calculateTimeout;
-  final Uint8List? Function()? getSelfPublicKey;
   final String Function(Contact, String)? prepareContactOutboundText;
   final AppSettingsService? appSettingsService;
   final AppDebugLogService? debugLogService;
@@ -70,7 +69,6 @@ class RetryServiceConfig {
     this.clearContactPath,
     this.setContactPath,
     this.calculateTimeout,
-    this.getSelfPublicKey,
     this.prepareContactOutboundText,
     this.appSettingsService,
     this.debugLogService,
@@ -101,7 +99,14 @@ class MessageRetryService extends ChangeNotifier {
   final Map<String, List<String>> _sendQueue = {};
   final Set<String> _activeMessages = {};
   final Set<String> _resolvedMessages = {};
-  final Map<String, String> _expectedHashToMessageId = {};
+
+  /// Message ids dispatched and awaiting their RESP_CODE_SENT, oldest first.
+  /// The radio reports the real ACK hash in that frame. Firmware that derives
+  /// the hash from values the companion never sees (meshcomod substitutes its
+  /// own RTC timestamp and a free-running attempt counter) makes a predicted
+  /// hash unmatchable, so the reported hash is bound to the in-flight message
+  /// rather than required to match a prediction.
+  final List<String> _awaitingSentConfirm = [];
 
   RetryServiceConfig? _config;
 
@@ -387,48 +392,24 @@ class MessageRetryService extends ChangeNotifier {
     final attempt = message.retryCount;
     final timestampSeconds = message.timestamp.millisecondsSinceEpoch ~/ 1000;
 
-    // Compute expected ACK hash that device will return in RESP_CODE_SENT
-    // IMPORTANT: Use the transformed text (with SMAZ encoding if enabled) to match device's hash
-    final selfPubKey = config.getSelfPublicKey?.call();
-    if (config.getSelfPublicKey != null && selfPubKey == null) {
-      throw StateError('Self public key unknown; cannot track ACK');
-    }
-    String? expectedHashHex;
-    if (selfPubKey != null) {
-      final outboundText =
-          config.prepareContactOutboundText?.call(contact, message.text) ??
-          message.text;
-      final expectedHash = MessageRetryService.computeExpectedAckHash(
-        timestampSeconds,
-        attempt,
-        outboundText,
-        selfPubKey,
-      );
-      expectedHashHex = expectedHash.toRadixString(16).padLeft(8, '0');
-      _expectedHashToMessageId[expectedHashHex] = messageId;
+    final shortText = message.text.length > 20
+        ? '${message.text.substring(0, 20)}...'
+        : message.text;
+    config.debugLogService?.info(
+      'Sent "$shortText" to ${contact.name} (attempt $attempt)',
+      tag: 'AckHash',
+    );
 
-      final shortText = message.text.length > 20
-          ? '${message.text.substring(0, 20)}...'
-          : message.text;
-      config.debugLogService?.info(
-        'Sent "$shortText" to ${contact.name} → expect ACK hash $expectedHashHex (attempt $attempt)',
-        tag: 'AckHash',
-      );
-    }
-
+    _awaitingSentConfirm.add(messageId);
     await config.sendMessage(contact, message.text, attempt, timestampSeconds);
-    _startSentWatchdog(messageId, attempt, expectedHashHex);
+    _startSentWatchdog(messageId, attempt);
   }
 
   /// Arms a timer for an attempt whose RESP_CODE_SENT has not arrived yet.
   /// Without it a lost SENT reply leaves the message pending forever and
   /// blocks the contact's queue. A SENT reply replaces this timer with the
   /// normal ACK timeout via [_startTimeoutTimer].
-  void _startSentWatchdog(
-    String messageId,
-    int attempt,
-    String? expectedHashHex,
-  ) {
+  void _startSentWatchdog(String messageId, int attempt) {
     final message = _pendingMessages[messageId];
     final contact = _pendingContacts[messageId];
     if (message == null || contact == null) return;
@@ -454,17 +435,7 @@ class MessageRetryService extends ChangeNotifier {
         'after ${timeoutMs}ms → treating as timed out',
         tag: 'AckHash',
       );
-      if (expectedHashHex != null &&
-          _expectedHashToMessageId[expectedHashHex] == messageId) {
-        // Drop the SENT expectation so a late SENT for this attempt can't
-        // restart timers for the retry; keep the hash ACK-matchable in case
-        // the radio did transmit it.
-        _expectedHashToMessageId.remove(expectedHashHex);
-        _addAckHashMapping(expectedHashHex, messageId, current);
-        final hash = int.parse(expectedHashHex, radix: 16);
-        final hashes = _expectedAckHashes.putIfAbsent(messageId, () => []);
-        if (!hashes.contains(hash)) hashes.add(hash);
-      }
+      _awaitingSentConfirm.remove(messageId);
       _handleTimeout(messageId);
     });
   }
@@ -510,36 +481,22 @@ class MessageRetryService extends ChangeNotifier {
 
     final ackHashHex = ackHash.toRadixString(16).padLeft(8, '0');
 
-    // Try hash-based matching (fixes LoRa message drops causing mismatches)
-    String? messageId = _expectedHashToMessageId.remove(ackHashHex);
-    Contact? contact;
-
-    if (messageId != null) {
-      contact = _pendingContacts[messageId];
-      final message = _pendingMessages[messageId];
-
-      if (contact != null && message != null) {
-        final shortText = message.text.length > 20
-            ? '${message.text.substring(0, 20)}...'
-            : message.text;
-        config.debugLogService?.info(
-          'RESP_CODE_SENT received: ACK hash $ackHashHex ✓ matched "$shortText" to ${contact.name}',
-          tag: 'AckHash',
-        );
-      } else {
-        config.debugLogService?.warn(
-          'RESP_CODE_SENT: ACK hash $ackHashHex matched but message no longer pending',
-          tag: 'AckHash',
-        );
-        messageId = null;
-        contact = null;
-      }
-    }
-
+    // The radio reports the real hash here; it is not predictable from what the
+    // companion sent (meshcomod substitutes its own timestamp and attempt
+    // counter), so it is bound to the message that is actually in flight.
+    final String? messageId = _takeNextAwaitingSentConfirm();
+    final Contact? contact = messageId == null
+        ? null
+        : _pendingContacts[messageId];
     if (messageId == null || contact == null) {
       debugPrint('No pending message found for ACK hash: $ackHashHex');
       return false;
     }
+    config.debugLogService?.info(
+      'RESP_CODE_SENT: ACK hash $ackHashHex bound to "'
+      '${_pendingMessages[messageId]?.text ?? ''}" to ${contact.name}',
+      tag: 'AckHash',
+    );
 
     final message = _pendingMessages[messageId]!;
     _addAckHashMapping(ackHashHex, messageId, message);
@@ -595,6 +552,18 @@ class MessageRetryService extends ChangeNotifier {
     }
   }
 
+  /// Oldest dispatched message still waiting for its RESP_CODE_SENT, skipping
+  /// any that resolved or were cancelled while in flight.
+  String? _takeNextAwaitingSentConfirm() {
+    while (_awaitingSentConfirm.isNotEmpty) {
+      final id = _awaitingSentConfirm.removeAt(0);
+      if (_pendingMessages.containsKey(id) && !_resolvedMessages.contains(id)) {
+        return id;
+      }
+    }
+    return null;
+  }
+
   void _startTimeoutTimer(String messageId, int timeoutMs) {
     _timeoutTimers[messageId]?.cancel();
     _timeoutTimers[messageId] = Timer(Duration(milliseconds: timeoutMs), () {
@@ -613,7 +582,7 @@ class MessageRetryService extends ChangeNotifier {
       mappings.removeWhere((mapping) => mapping.messageId == messageId);
       return mappings.isEmpty;
     });
-    _expectedHashToMessageId.removeWhere((_, msgId) => msgId == messageId);
+    _awaitingSentConfirm.remove(messageId);
     final contactKey = _pendingContacts[messageId]?.publicKeyHex;
     _pendingMessages.remove(messageId);
     _pendingContacts.remove(messageId);

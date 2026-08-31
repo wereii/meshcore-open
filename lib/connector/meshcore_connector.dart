@@ -1634,7 +1634,6 @@ class MeshCoreConnector extends ChangeNotifier {
               contactKey: contactKey,
               deviceTimeoutMs: deviceTimeoutMs,
             ),
-        getSelfPublicKey: () => _selfPublicKey,
         prepareContactOutboundText: prepareContactOutboundText,
         appSettingsService: appSettingsService,
         debugLogService: _appDebugLogService,

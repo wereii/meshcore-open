@@ -19,14 +19,12 @@ void main() {
   late Map<String, Message> latest;
   late List<String> sentTexts;
   late bool failSends;
-  Uint8List? selfKey;
 
   setUp(() {
     service = MessageRetryService();
     latest = {};
     sentTexts = [];
     failSends = false;
-    selfKey = Uint8List(32);
     service.initialize(
       RetryServiceConfig(
         sendMessage: (_, text, _, _) async {
@@ -35,7 +33,6 @@ void main() {
         },
         addMessage: (_, m) => latest[m.messageId] = m,
         updateMessage: (m) => latest[m.messageId] = m,
-        getSelfPublicKey: () => selfKey,
       ),
     );
   });
@@ -56,15 +53,6 @@ void main() {
     await service.sendMessageWithRetry(contact: contact, text: 'b');
     await pumpEventQueue();
     expect(sentTexts, ['b']);
-  });
-
-  test('unknown self key fails instead of waiting forever', () async {
-    selfKey = null;
-    await service.sendMessageWithRetry(contact: _contact(), text: 'a');
-    await pumpEventQueue();
-    expect(byText('a').status, MessageStatus.failed);
-    expect(sentTexts, isEmpty);
-    expect(service.hasPendingMessages, isFalse);
   });
 
   test('failAllPending fails in-flight and queued messages', () async {
