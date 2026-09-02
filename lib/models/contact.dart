@@ -158,10 +158,14 @@ class Contact {
       }
       final pubKey = reader.readBytes(pubKeySize);
 
-      // Guard: reject contacts with zeroed or mostly-zeroed public keys
-      // (indicates corrupt flash storage on the firmware side)
-      final zeroCount = pubKey.where((b) => b == 0).length;
-      if (zeroCount > pubKeySize ~/ 2) return null;
+      // Guard: reject an all-zero public key — a blank or erased record read
+      // back as a contact. The previous "more than half the bytes are zero"
+      // threshold was too broad: it also dropped reserved keys that are a short
+      // tag zero-padded to 32 bytes, with no log line to show why.
+      if (pubKey.every((b) => b == 0)) {
+        appLogger.info('Dropped contact frame: public key is all zeros');
+        return null;
+      }
 
       final type = reader.readByte();
       final flags = reader.readByte();
