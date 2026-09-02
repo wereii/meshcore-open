@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:meshcore_open/connector/meshcore_protocol.dart';
 import 'package:meshcore_open/models/contact.dart';
@@ -614,6 +615,105 @@ void main() {
       expect(addedMessage, isNotNull);
       expect(addedMessage!.pathLength, equals(-1));
       expect(addedMessage!.pathBytes, isEmpty);
+    });
+  });
+  group('updateMessageFromSent — binds the radio-reported ACK hash', () {
+    // meshcomod discards the timestamp and attempt the companion sends and
+    // substitutes its own RTC value and a free-running counter, so the hash
+    // the app predicts can never match. The radio reports the real hash in
+    // RESP_CODE_SENT; binding that to the in-flight message is what makes the
+    // send resolvable at all.
+    test(
+      'confirms the in-flight message when the ACK hash was not predicted',
+      () async {
+        final retryService = MessageRetryService();
+        final updates = <Message>[];
+        final contact = _makeContact(
+          publicKey: recipientKey,
+          pathLength: 2,
+          path: const [0x10, 0x20],
+        );
+
+        retryService.initialize(
+          RetryServiceConfig(
+            sendMessage: (_, _, _, _) {},
+            addMessage: (_, _) {},
+            updateMessage: updates.add,
+            clearContactPath: (_) {},
+            setContactPath: (_, _, _) {},
+          ),
+        );
+
+        await retryService.sendMessageWithRetry(
+          contact: contact,
+          text: 'hello',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        final matched = retryService.updateMessageFromSent(0xDEADBEEF, 5000);
+
+        expect(matched, isTrue);
+        expect(updates.last.status, equals(MessageStatus.sent));
+        expect(updates.last.expectedAckHash, equals(0xDEADBEEF));
+      },
+    );
+
+    test('returns false when no direct message is in flight', () {
+      final retryService = MessageRetryService();
+
+      retryService.initialize(
+        RetryServiceConfig(
+          sendMessage: (_, _, _, _) {},
+          addMessage: (_, _) {},
+          updateMessage: (_) {},
+          clearContactPath: (_) {},
+          setContactPath: (_, _, _) {},
+        ),
+      );
+
+      // A channel send produces RESP_CODE_SENT too; the direct path must not
+      // swallow it, or channel messages never leave "pending".
+      expect(retryService.updateMessageFromSent(0xDEADBEEF, 5000), isFalse);
+    });
+  });
+
+  group('dispatch watchdog', () {
+    test('retries when RESP_CODE_SENT never arrives', () {
+      FakeAsync().run((async) {
+        final retryService = MessageRetryService();
+        final attempts = <int>[];
+        final contact = _makeContact(
+          publicKey: recipientKey,
+          pathLength: 2,
+          path: const [0x10, 0x20],
+        );
+
+        retryService.initialize(
+          RetryServiceConfig(
+            sendMessage: (_, _, attempt, _) => attempts.add(attempt),
+            addMessage: (_, _) {},
+            updateMessage: (_) {},
+            clearContactPath: (_) {},
+            setContactPath: (_, _, _) {},
+          ),
+        );
+
+        retryService.sendMessageWithRetry(contact: contact, text: 'hello');
+        async.flushMicrotasks();
+        expect(attempts, hasLength(1), reason: 'first attempt dispatched');
+
+        // The radio never answers with RESP_CODE_SENT. Without a watchdog
+        // armed at dispatch the message hangs forever and holds its in-flight
+        // slot, silently blocking every later message to this contact.
+        async.elapse(const Duration(minutes: 2));
+        async.flushMicrotasks();
+
+        expect(
+          attempts.length,
+          greaterThan(1),
+          reason: 'dispatch watchdog should have retried the send',
+        );
+      });
     });
   });
 }
